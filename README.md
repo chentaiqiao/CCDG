@@ -44,7 +44,7 @@ They are all located in `src/config`.
 `--config` refers to the config files in `src/config/algs`
 `--env-config` refers to the config files in `src/config/envs`
 
-To adjust the $\rho$ and $\beta$ parameters to train CCDG, where thres=$\rho$ and prob= $\beta$:
+To adjust the $\rho$ and $\beta$ parameters to train CCDG, where thres= $\rho$ and prob= $\beta$:
 ```shell
 python3 src/main.py 
 --config=ccdg
