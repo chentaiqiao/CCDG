@@ -1,4 +1,4 @@
-# NDQ: Learning Nearly Decomposable Value Functions with Communication Minimization
+# CCDG: Optimizing Multi-Agent Communication via Cognitive Similarity Assessment and Message Gating
 
 ## Note
  This codebase accompanies paper [Optimizing Multi-Agent Communication via Cognitive Similarity Assessment and Message Gating], 
