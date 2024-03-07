@@ -9,9 +9,10 @@ from utils.logging import Logger
 from utils.timehelper import time_left, time_str
 from os.path import dirname, abspath
 
-from learners import REGISTRY as le_REGISTRY
-from runners import REGISTRY as r_REGISTRY
-from controllers import REGISTRY as mac_REGISTRY
+from learners import REGISTRY as le_REGISTRY#离线学习类，用打完一局后的batch样本训练Q神经网络
+from runners import REGISTRY as r_REGISTRY#游戏运行类
+from controllers import REGISTRY as mac_REGISTRY#智能体类
+#这三类中运行类可放到ma_main,智能体类放到ccdg的目录下输出所有智能体选择的动作，学习类玩完运行后，经验回放学习，按loss更新actor-critic参数
 from components.episode_buffer import ReplayBuffer
 from components.transforms import OneHot
 
@@ -65,7 +66,7 @@ def run(_run, _config, _log):
 
 def evaluate_sequential(args, runner):
 
-    for _ in range(args.test_nepisode):
+    for _ in range(args.test_nepisode):#测试时，玩几局计算胜率
         runner.run(test_mode=True)
 
     if args.save_replay:
@@ -75,7 +76,7 @@ def evaluate_sequential(args, runner):
 
 def run_sequential(args, logger):
 
-    # Init runner so we can get env info
+    # Init runner so we can get env info，初始化episoderunner.py
     runner = r_REGISTRY[args.runner](args=args, logger=logger)
 
     # Set up schemes and groups here
@@ -93,6 +94,7 @@ def run_sequential(args, logger):
         "state": {"vshape": env_info["state_shape"]},
         "obs": {"vshape": env_info["obs_shape"], "group": "agents"},
         "actions": {"vshape": (1,), "group": "agents", "dtype": th.long},
+        "p_i": {"vshape": (1,)},
         "avail_actions": {"vshape": (env_info["n_actions"],), "group": "agents", "dtype": th.int},
         "reward": {"vshape": (1,)},
         "terminated": {"vshape": (1,), "dtype": th.uint8},
@@ -108,13 +110,13 @@ def run_sequential(args, logger):
                           preprocess=preprocess,
                           device="cpu" if args.buffer_cpu_only else args.device)
 
-    # Setup multiagent controller here这里调用controllers/tar_comm_controller.py
+    # Setup multiagent controller here这里调用controllers/controller.py,初始化
     mac = mac_REGISTRY[args.mac](buffer.scheme, groups, args)
 
-    # Give runner the scheme
+    # Give runner the scheme，初始化游戏的运行类，并把上句的智能体传到运行类
     runner.setup(scheme=scheme, groups=groups, preprocess=preprocess, mac=mac)
 
-    # 这里调用learners/categorical_q_learner.py
+    # 这里调用learners/learner.py，初始化，并把上句的智能体传到学习类
     learner = le_REGISTRY[args.learner](mac, buffer.scheme, logger, args)
 
     if args.use_cuda:
@@ -166,7 +168,7 @@ def run_sequential(args, logger):
 
     while runner.t_env <= args.t_max:
 
-        # Run for a whole episode at a time
+        # Run for a whole episode at a time玩一整局，游戏运行类返回一个batch，可存至经验缓冲区
         episode_batch = runner.run(test_mode=False)
         buffer.insert_episode_batch(episode_batch)
 
@@ -179,7 +181,7 @@ def run_sequential(args, logger):
 
             if episode_sample.device != args.device:
                 episode_sample.to(args.device)
-            # 这里调用learners/categorical_q_learner.py执行训练
+            # 这里调用learners/categorical_q_learner.py利用经验缓冲区执行训练
             learner.train(episode_sample, runner.t_env, episode)
 
         # Execute test runs once in a while
