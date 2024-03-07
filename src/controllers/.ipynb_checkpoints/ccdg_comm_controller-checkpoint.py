@@ -1,5 +1,6 @@
 from modules.agents import REGISTRY as agent_REGISTRY
 from modules.comm import REGISTRY as comm_REGISTRY
+from modules.comm import Gated_Net
 from components.action_selectors import REGISTRY as action_REGISTRY
 import math
 import torch as th
@@ -12,11 +13,9 @@ import random
 # This multi-agent controller shares parameters between agents
 class CCDGCommMAC:
     def __init__(self, scheme, groups, args):
-        
         self.prob=args.prob#0,0.2,0.25,0.3,0.5
         self.thres=args.thres/args.n_agents#0 0.05 0.0625 0.075 0.125
         print('your prob is:',self.prob,',your thres is:',self.thres)
-        self.n_agents = args.n_agents
         self.args = args
         self.comm_embed_dim = args.comm_embed_dim
         input_shape_for_comm = 0
@@ -34,6 +33,7 @@ class CCDGCommMAC:
 
         if args.comm:
             self.comm = comm_REGISTRY[self.args.comm_method](input_shape_for_comm, args)#调用modules/ccdg_comm.py，由神经网络生产q,k,v(message)
+            self.Gated_Net=Gated_Net(input_shape_for_comm, args)
 
         self.is_print_once = False
 
@@ -52,13 +52,13 @@ class CCDGCommMAC:
                                                             test_mode=test_mode)
         return chosen_actions
 
-    def forward(self, ep_batch, t, test_mode=False, thres=0., prob=0.):
+    def forward(self, ep_batch, t, test_mode=False, thres=0., prob=0. ,gate=False):#gate=False表需要Gated_Net
         agent_inputs = self._build_inputs(ep_batch, t)
 
         if self.args.comm:#生成消息，调用本文件的_communicate
-            (_, _), messages, _ = self._communicate(ep_batch.batch_size, agent_inputs,
+            (_, _), messages,p_i, _ = self._communicate(ep_batch.batch_size, agent_inputs,
                                                     self.hidden_states.detach(), test_mode,
-                                                    thres=thres, prob=prob)
+                                                    thres=thres, prob=prob,gate=gate)
             agent_inputs = th.cat([agent_inputs, messages], dim=1)#把自身观测和消息合并为输入(观测)
 
         avail_actions = ep_batch["avail_actions"][:, t]
@@ -151,18 +151,20 @@ class CCDGCommMAC:
         else:
             return input_shape
 
-    def _cut_alpha(self, attn, thres=0., prob=0.):
+    def _cut_alpha(self, attn, p_i, thres=0., prob=0.):
         if self.args.is_cur_mu:
-            s_num = 0      
+            s_num = 0
+            print(attn)
             attn = attn.detach()
             attn_2 = attn.detach().cpu().numpy()
             for i in range(self.n_agents):
                 for j in range(self.n_agents):
                     if i != j:
                     #agent i对j的关注为0
-                        if attn_2[0, i, j] <= thres or random.random() < prob:
+                        if attn_2[0, i, j] <= thres or p_i[j] < prob:
                             attn[0, i, j] = 0.
                             s_num += 1
+            print(attn)
         elif thres > 0:
             attn = attn.detach().cpu()
             index = np.argsort(abs(attn).reshape(-1))
@@ -175,17 +177,20 @@ class CCDGCommMAC:
             attn = attn.cuda()
         return attn
 
-    def _communicate(self, bs, inputs, hidden_states, test_mode, thres=0., prob=0.):
+    def _communicate(self, bs, inputs, hidden_states, test_mode, thres=0., prob=0.,gate=False):
         # shape = (bs * self.n_agents, -1)
         inputs = th.cat([inputs, hidden_states.view(bs * self.n_agents, -1)], dim=1).detach()
         message, signature, query = self.comm(inputs)
-
+        if gate==False:
+            p_i=self.Gated_Net(inputs)
+        else:
+            p_i=gate#由learners/ccdg_q_learner.py提供
+        
         message = message.view(bs, self.n_agents, -1)
         signature = signature.view(bs, self.n_agents, -1)
         query = query.view(bs, self.n_agents, -1)
 
-        # 连接和加权消息
-        #门控，筛选消息
+        # 连接和加权消息.门控，筛选消息
 
         if test_mode:
             all_m = message.clone()
@@ -194,12 +199,12 @@ class CCDGCommMAC:
             attn = F.softmax(scores, dim=-1)
             thres=float(self.thres)
             prob=float(self.prob)
-            attn = self._cut_alpha(attn, thres=thres, prob=prob)
+            
+            attn = self._cut_alpha(attn, p_i, thres=thres, prob=prob)
             comm = th.matmul(attn, all_m)
             comm = comm.reshape(bs * self.n_agents, -1)
-                 
             
-            return (None, None), comm, None
+            return (None, None), comm,p_i, None
         else:
             all_m = message.clone()
             scores = th.matmul(query, signature.transpose(-2, -1)) / math.sqrt(self.args.comm_embed_dim)
@@ -207,7 +212,7 @@ class CCDGCommMAC:
             comm = th.matmul(attn, all_m)
             comm = comm.reshape(bs * self.n_agents, -1)
 
-            return (None, None), comm, None
+            return (None, None), comm,p_i, None
 
     def clean(self):
         if self.args.env_args['print_rew']:
