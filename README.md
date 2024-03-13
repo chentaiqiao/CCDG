@@ -44,15 +44,16 @@ They are all located in `src/config`.
 `--config` refers to the config files in `src/config/algs`
 `--env-config` refers to the config files in `src/config/envs`
 
-To adjust the $\rho$ and $\beta$ parameters to train CCDG, where thres= $\rho$ and prob= $\beta$:
+To adjust the $\rho$ 、$H$and $BAT$ parameters to train CCDG:
 ```shell
 python3 src/main.py 
 --config=ccdg
 --env-config=sc2
 with
 env_args.map_name=25m
-thres=0.2
-prob=0.4
+rho=0.2
+BAT=0.6
+H=10000
 ```
 
 SMAC maps can be found in src/smac_plus/sc2_maps/.
