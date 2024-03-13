@@ -14,11 +14,26 @@ class CCDGComm(nn.Module):
         self.query = nn.Linear(input_shape + args.rnn_hidden_dim, args.signature_dim)
 
     def forward(self, inputs):
-        massage = self.value(inputs)
-        signature = self.signature(inputs)
-        query = self.query(inputs)
+        V = self.value(inputs)
+        K = self.signature(inputs)
+        Q = self.query(inputs)
         
-        return massage, signature, query
+        return V, K, Q
+    
+class Transform(nn.Module):
+    def __init__(self, input_shape, args):
+        super(Transform, self).__init__()
+        self.args = args
+        self.lstm = nn.LSTM(input_shape + args.rnn_hidden_dim, args.comm_embed_dim, num_layers = 1)
+        self.h0=torch.zeros(1,1,args.comm_embed_dim)
+        self.c0=torch.zeros(1,1,args.comm_embed_dim)
+        
+
+    def forward(self, inputs):
+        inputs = inputs.unsqueeze(1)
+        output, (hn, cn) = self.lstm(inputs, (self.h0, self.c0))
+        
+        return output
 
 class Gated_Net(nn.Module):
     def __init__(self, input_shape, args, rnn_hidden_dim=32, num_layers=2):
