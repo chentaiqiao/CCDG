@@ -1,6 +1,6 @@
 from modules.agents import REGISTRY as agent_REGISTRY
-from modules.comm import REGISTRY as comm_REGISTRY
-from modules.comm import Gated_Net
+from modules.comm import CCDGComm as Cognitive
+from modules.comm import Gated_Net,Transform
 from components.action_selectors import REGISTRY as action_REGISTRY
 import math
 import torch as th
@@ -13,10 +13,11 @@ import random
 # This multi-agent controller shares parameters between agents
 class CCDGCommMAC:
     def __init__(self, scheme, groups, args):
-        self.prob=args.prob#0,0.2,0.25,0.3,0.5
-        self.thres=args.thres/args.n_agents#0 0.05 0.0625 0.075 0.125
+        self.prob=1-args.BAT
+        self.thres=args.rho/args.n_agents
         print('your prob is:',self.prob,',your thres is:',self.thres)
         self.args = args
+        self.n_agents=args.n_agents
         self.comm_embed_dim = args.comm_embed_dim
         input_shape_for_comm = 0
         if args.comm:
@@ -32,7 +33,8 @@ class CCDGCommMAC:
         self.hidden_states = None
 
         if args.comm:
-            self.comm = comm_REGISTRY[self.args.comm_method](input_shape_for_comm, args)#调用modules/ccdg_comm.py，由神经网络生产q,k,v(message)
+            self.comm = Cognitive(input_shape_for_comm, args)#调用modules/ccdg_comm.py，由神经网络生产q,k,v
+            self.Transform = Transform(input_shape_for_comm, args)
             self.Gated_Net=Gated_Net(input_shape_for_comm, args)
 
         self.is_print_once = False
@@ -151,20 +153,18 @@ class CCDGCommMAC:
         else:
             return input_shape
 
-    def _cut_alpha(self, attn, p_i, thres=0., prob=0.):
+    def Aggregation(self, attn, p_i, thres=0., prob=0.):
         if self.args.is_cur_mu:
             s_num = 0
-            print(attn)
             attn = attn.detach()
             attn_2 = attn.detach().cpu().numpy()
             for i in range(self.n_agents):
                 for j in range(self.n_agents):
                     if i != j:
                     #agent i对j的关注为0
-                        if attn_2[0, i, j] <= thres or p_i[j] < prob:
+                        if attn_2[0, i, j] <= thres or p_i[j] < prob:#clip by M^new and p of gated
                             attn[0, i, j] = 0.
                             s_num += 1
-            print(attn)
         elif thres > 0:
             attn = attn.detach().cpu()
             index = np.argsort(abs(attn).reshape(-1))
@@ -180,7 +180,8 @@ class CCDGCommMAC:
     def _communicate(self, bs, inputs, hidden_states, test_mode, thres=0., prob=0.,gate=False):
         # shape = (bs * self.n_agents, -1)
         inputs = th.cat([inputs, hidden_states.view(bs * self.n_agents, -1)], dim=1).detach()
-        message, signature, query = self.comm(inputs)
+        V, signature, query = self.comm(inputs)
+        message=self.Transform(inputs)
         if gate==False:
             p_i=self.Gated_Net(inputs)
         else:
@@ -190,8 +191,6 @@ class CCDGCommMAC:
         signature = signature.view(bs, self.n_agents, -1)
         query = query.view(bs, self.n_agents, -1)
 
-        # 连接和加权消息.门控，筛选消息
-
         if test_mode:
             all_m = message.clone()
             scores = th.matmul(query, signature.transpose(-2, -1)) / math.sqrt(self.args.comm_embed_dim)
@@ -200,7 +199,7 @@ class CCDGCommMAC:
             thres=float(self.thres)
             prob=float(self.prob)
             
-            attn = self._cut_alpha(attn, p_i, thres=thres, prob=prob)
+            attn = self.Aggregation(attn, p_i, thres=thres, prob=prob)
             comm = th.matmul(attn, all_m)
             comm = comm.reshape(bs * self.n_agents, -1)
             
@@ -214,8 +213,3 @@ class CCDGCommMAC:
 
             return (None, None), comm,p_i, None
 
-    def clean(self):
-        if self.args.env_args['print_rew']:
-            self.c_step = 0
-            self.cut_mean_num_list = []
-            self.is_print_once = False
