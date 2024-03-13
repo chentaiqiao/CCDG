@@ -39,12 +39,6 @@ signature_dim: 32
 
 is_cur_mu: True
 #True 消融超参数
-#参数作用于controllers/tar_comm_controller.py
-thres: 0.4
-prob: 0
-test_is_cut: False
-test_is_cut_prob: False
-test_cut_prob_thres: 0.
-test_cut_prob_list: [0., 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-test_cut_list: [0., 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-test_is_print_once: False
+rho: 0
+BAT: 1
+H: 10000
