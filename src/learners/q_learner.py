@@ -4,10 +4,10 @@ from modules.mixers.vdn import VDNMixer
 from modules.mixers.qmix import QMixer
 import torch as th
 from torch.optim import RMSprop
-import torch.distributions as D
+from collections import deque  
 
 
-class CateQLearner:
+class CCDGQLearner:
     def __init__(self, mac, scheme, logger, args):
         self.args = args
         self.mac = mac
@@ -16,6 +16,7 @@ class CateQLearner:
         self.params = list(mac.parameters())
 
         self.last_target_update_episode = 0
+        self.Pi_com_list = deque(maxlen=args.H)  #改写,初始化Pi_com_list
 
         self.mixer = None
         if args.mixer is not None:
@@ -25,7 +26,7 @@ class CateQLearner:
                 self.mixer = QMixer(args)
             else:
                 raise ValueError("Mixer {} not recognised.".format(args.mixer))
-            self.params = self.params+list(self.mixer.parameters())
+            self.params += list(self.mixer.parameters())
             self.target_mixer = copy.deepcopy(self.mixer)
 
         self.optimiser = RMSprop(params=self.params, lr=args.lr, alpha=args.optim_alpha, eps=args.optim_eps)
@@ -34,82 +35,78 @@ class CateQLearner:
         self.target_mac = copy.deepcopy(mac)
 
         self.log_stats_t = -self.args.learner_log_interval - 1
-
-        self.s_mu = th.zeros(1)
-        self.s_sigma = th.ones(1)
-
-    def get_comm_beta(self, t_env):
-        comm_beta = self.args.comm_beta
-        if self.args.is_comm_beta_decay and t_env > self.args.comm_beta_start_decay:
-            comm_beta =comm_beta.clone()+ 1. * (self.args.comm_beta_target - self.args.comm_beta) / \
-                         (self.args.comm_beta_end_decay - self.args.comm_beta_start_decay) * \
-                         (t_env - self.args.comm_beta_start_decay)
-        return comm_beta
-
-    def get_comm_entropy_beta(self, t_env):
-        comm_entropy_beta = self.args.comm_entropy_beta
-        if self.args.is_comm_entropy_beta_decay and t_env > self.args.comm_entropy_beta_start_decay:
-            comm_entropy_beta =comm_entropy_beta.clone()+ 1. * (self.args.comm_entropy_beta_target - self.args.comm_entropy_beta) / \
-                         (self.args.comm_entropy_beta_end_decay - self.args.comm_entropy_beta_start_decay) * \
-                         (t_env - self.args.comm_entropy_beta_start_decay)
-        return comm_entropy_beta
+    def cal_q(self,action,batch,t):
+        # Max over target Q-Values
+        max_qvals = action.max(dim=3)[0]
+        # Mix
+        if self.mixer is not None:
+            target_max_qvals = self.target_mixer(max_qvals, batch["state"][t, 1:])
+        return target_max_qvals
 
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
-        #with th.autograd.set_detect_anomaly(True):
+        # Get the relevant quantities
+        args=self.args
+        obs=batch["obs"][:, :-1]
+        p_i=batch["p_i"][:, :-1]
         rewards = batch["reward"][:, :-1]
         actions = batch["actions"][:, :-1]
         terminated = batch["terminated"][:, :-1].float()
         mask = batch["filled"][:, :-1].float()
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
         avail_actions = batch["avail_actions"]
-
+        
         # Calculate estimated Q-Values
-        # shape = (bs, self.n_agents, -1)
         mac_out = []
-        mu_out = []
-        sigma_out = []
-        logits_out = []
-        m_sample_out = []
-        g_out = []
         self.mac.init_hidden(batch.batch_size)
+        
+        
         for t in range(batch.max_seq_length):
-            if self.args.comm and self.args.use_IB:
-                agent_outs, (mu, sigma), logits, m_sample = self.mac.forward(batch, t=t)
-                mu_out.append(mu)
-                sigma_out.append(sigma)
-                logits_out.append(logits)
-                m_sample_out.append(m_sample)
-            else:
-                agent_outs = self.mac.forward(batch, t=t)
+            agent_outs = self.mac.forward(batch, t=t)
+            #改写,添加gated loss
+            # Construct gate for each agent
+            gate = []
+            for i in range(args.n_agents):
+                g = [1] * args.n_agents
+                g[i] = 0
+                gate.append(g)
+            
+            agent_outs_com = self.mac.forward(batch, t=t, gate=[1] * args.n_agents)
+            a_com = agent_outs_com  # Result for gate=[1,1,1,...,1]
+            
+            a_ncom = []
+            for i, g in enumerate(gate):
+                if g != [1] * args.n_agents:
+                    agent_outs_ncom = self.mac.forward(batch, t=t, gate=g)
+                    a_ncom.append(agent_outs_ncom)
+            
+            # Calculate q_com and q_ncom
+            q_com = self.cal_q(a_com,batch,t) # ,实现cal_q
+            q_ncom = []
+            for a in a_ncom:
+                q_ncom.append(self.cal_q(a,batch,t))  
+            
+            # Calculate Pi_com
+            Pi_com = q_com - q_ncom[args.n_agents - 1]
+            
+            # Expand Pi_com for each time step
+            if len(self.Pi_com_list) == args.H:#满了
+                self.Pi_com_list.popleft()  #删除过期元素
+                
+            self.Pi_com_list.append(Pi_com)
+            # Gated end
+            
             mac_out.append(agent_outs)
         mac_out = th.stack(mac_out, dim=1)  # Concat over time
-        if self.args.use_IB:
-            mu_out = th.stack(mu_out.clone(), dim=1).clone()[:, :-1]  # Concat over time
-            sigma_out = th.stack(sigma_out, dim=1).clone()[:, :-1]  # Concat over time
-            logits_out = th.stack((logits_out), dim=1).clone()[:, :-1]
-            m_sample_out = th.stack(m_sample_out.clone(), dim=1).clone()[:, :-1]
 
         # Pick the Q-Values for the actions taken by each agent
-        chosen_action_qvals = th.gather(mac_out.clone()[:, :-1], dim=3, index=actions).squeeze(3)  # Remove the last dim
-        # I believe that code up to here is right...
-
-        # Q values are right, the main issue is to calculate loss for message...
+        chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)  # Remove the last dim
 
         # Calculate the Q-Values necessary for the target
         target_mac_out = []
         self.target_mac.init_hidden(batch.batch_size)
         for t in range(batch.max_seq_length):
-            if self.args.comm and self.args.use_IB:
-                target_agent_outs, (target_mu, target_sigma), target_logits, target_m_sample = \
-                    self.target_mac.forward(batch, t=t)
-            else:
-                target_agent_outs = self.target_mac.forward(batch, t=t)
+            target_agent_outs = self.target_mac.forward(batch, t=t)
             target_mac_out.append(target_agent_outs)
-
-        # label
-        label_target_max_out = th.stack(target_mac_out[:-1], dim=1)
-        label_target_max_out[avail_actions.clone()[:, :-1] == 0] = -9999999
-        label_target_actions = label_target_max_out.max(dim=3, keepdim=True)[1]
 
         # We don't need the first timesteps Q-Value estimate for calculating targets
         target_mac_out = th.stack(target_mac_out[1:], dim=1)  # Concat across time
@@ -128,8 +125,8 @@ class CateQLearner:
 
         # Mix
         if self.mixer is not None:
-            chosen_action_qvals = self.mixer(chosen_action_qvals.clone(), batch["state"][:, :-1])
-            target_max_qvals = self.target_mixer(target_max_qvals.clone(), batch["state"][:, 1:])
+            chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
+            target_max_qvals = self.target_mixer(target_max_qvals, batch["state"][:, 1:])
 
         # Calculate 1-step Q-Learning targets
         targets = rewards + self.args.gamma * (1 - terminated) * target_max_qvals
@@ -137,83 +134,55 @@ class CateQLearner:
         # Td-error
         td_error = (chosen_action_qvals - targets.detach())
 
-        mask = mask.clone().expand_as(td_error)
+        mask = mask.expand_as(td_error)
 
         # 0-out the targets that came from padded data
         masked_td_error = td_error * mask
 
         # Normal L2 loss, take mean over actual data
         loss = (masked_td_error ** 2).sum() / mask.sum()
-
-        if self.args.only_downstream or not self.args.use_IB:
-            expressiveness_loss = th.Tensor([0.])
-            compactness_loss = th.Tensor([0.])
-            entropy_loss = th.Tensor([0.])
-            comm_loss = th.Tensor([0.])
-            comm_beta = th.Tensor([0.])
-            comm_entropy_beta = th.Tensor([0.])
-        else:
-            # ### Optimize message
-            # 消息只受表达力和紧凑性损失的控制。
-            # 使用相同时间步长的arget q values计算交叉熵
-            expressiveness_loss = 0
-            label_prob = th.gather(logits_out, 3, label_target_actions).squeeze(3)
-            expressiveness_loss =expressiveness_loss.clone()+ (-th.log(label_prob + 1e-6)).sum() / mask.sum()
-
-            # Compute KL 散度
-            compactness_loss = D.kl_divergence(D.Normal(mu_out, sigma_out), D.Normal(self.s_mu, self.s_sigma)).sum() / \
-                               mask.sum()
-
-            # Entropy loss
-            entropy_loss = -D.Normal(self.s_mu, self.s_sigma).log_prob(m_sample_out).sum() / mask.sum()
-
-            # Gate loss
-            gate_loss = 0
-
-            # Total loss
-            comm_beta = self.get_comm_beta(t_env)
-            comm_entropy_beta = self.get_comm_entropy_beta(t_env)
-            comm_loss = expressiveness_loss + comm_beta * compactness_loss + comm_entropy_beta * entropy_loss
-            comm_loss = comm_loss.clone()*self.args.c_beta
-            loss =loss.clone()+ comm_loss
-            comm_beta = th.Tensor([th.tensor(comm_beta).clone()])
-            comm_entropy_beta = th.Tensor([th.tensor(comm_entropy_beta).clone()])
+        
+        #改写
+        # Sort Pi_com_list
+        Pi_com_list.sort()#L_Pi_com[],升序
+        
+        # Compare Pi_com_list with current Pi_com_list for each agent
+        Y_o = []
+        for i in range(args.n_agents):
+            threshold = args.prob * len(Pi_com_list)#T=threshold
+            if Pi_com_list[i] > threshold:
+                Y_o.append(1)
+            else:
+                Y_o.append(0)
+        
+        # Compute cross-entropy loss between p_i and Y_o
+        Gated_loss = -th.mean(p_i * th.log(Y_o) + (1 - p_i) * th.log(1 - Y_o))
+        loss=loss+Gated_loss
 
         # Optimise
         self.optimiser.zero_grad()
         loss.backward()
         grad_norm = th.nn.utils.clip_grad_norm_(self.params, self.args.grad_norm_clip)
         self.optimiser.step()
-        
 
-        # Update target
         if (episode_num - self.last_target_update_episode) / self.args.target_update_interval >= 1.0:
             self._update_targets()
             self.last_target_update_episode = episode_num
 
         if t_env - self.log_stats_t >= self.args.learner_log_interval:
             self.logger.log_stat("loss", loss.item(), t_env)
-            self.logger.log_stat("comm_loss", comm_loss.item(), t_env)
-            self.logger.log_stat("exp_loss", expressiveness_loss.item(), t_env)
-            self.logger.log_stat("comp_loss", compactness_loss.item(), t_env)
-            self.logger.log_stat("comm_beta", comm_beta.item(), t_env)
-            self.logger.log_stat("entropy_loss", entropy_loss.item(), t_env)
-            self.logger.log_stat("comm_beta", comm_beta.item(), t_env)
-            self.logger.log_stat("comm_entropy_beta", comm_entropy_beta.item(), t_env)
             self.logger.log_stat("grad_norm", grad_norm, t_env)
             mask_elems = mask.sum().item()
-            self.logger.log_stat("td_error_abs", (masked_td_error.abs().sum().item() / mask_elems), t_env)
-            self.logger.log_stat("q_taken_mean",
-                     (chosen_action_qvals * mask).sum().item() / (mask_elems * self.args.n_agents), t_env)
-            self.logger.log_stat("target_mean", (targets * mask).sum().item() / (mask_elems * self.args.n_agents),
-                     t_env)
+            self.logger.log_stat("td_error_abs", (masked_td_error.abs().sum().item()/mask_elems), t_env)
+            self.logger.log_stat("q_taken_mean", (chosen_action_qvals * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
+            self.logger.log_stat("target_mean", (targets * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
             self.log_stats_t = t_env
 
     def _update_targets(self):
         self.target_mac.load_state(self.mac)
         if self.mixer is not None:
             self.target_mixer.load_state_dict(self.mixer.state_dict())
-        # self.logger.console_logger.info("Updated target network")
+        #self.logger.console_logger.info("Updated target network")
 
     def cuda(self):
         self.mac.cuda()
@@ -221,8 +190,6 @@ class CateQLearner:
         if self.mixer is not None:
             self.mixer.cuda()
             self.target_mixer.cuda()
-        self.s_mu = self.s_mu.cuda()
-        self.s_sigma = self.s_sigma.cuda()
 
     def save_models(self, path):
         self.mac.save_models(path)
